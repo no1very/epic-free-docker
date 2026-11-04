@@ -1,0 +1,30 @@
+services:
+  epic:
+    build: .
+    image: epic-free-games:latest
+    container_name: epic-free-games
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - EPIC_COUNTRY=US          # Epic 账号所在地区，如 US / CN / HK
+      - EPIC_LOCALE=en-US
+      - CLAIM_INTERVAL_HOURS=6   # 检测频率（小时）
+      - WEB_PORT=8321            # 可视化面板端口（0 = 关闭面板）
+      - PUID=1000                # 容器运行用户 UID（NAS 上改为自己主机的，终端 id -u 查看）
+      - PGID=1000                # 容器运行用户 GID（id -g 查看）
+      # ---- 可选通知 ----
+      # - NOTIFY_METHOD=ntfy      # none / ntfy / bark / webhook
+      # - NOTIFY_URL=https://ntfy.sh/你的主题
+      # - NOTIFY_URL=https://api.day.app/你的BarkKey
+    ports:
+      - "8321:8321"              # 面板访问地址 http://主机IP:8321
+    volumes:
+      - ./data:/data
+    command: ["python", "main.py", "run"]
+
+# 首次登录（会打印授权链接，在任意设备浏览器打开）：
+#   docker compose run --rm epic python main.py login
+# 单次手动领取：
+#   docker compose run --rm epic python main.py once
+# 只看本周免费游戏（无需登录）：
+#   docker compose run --rm epic python main.py detect

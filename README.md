@@ -1,0 +1,93 @@
+# Epic 白嫖助手 · Docker 版（支持 ARM）
+
+自动领取 Epic Games 商店每周免费游戏的容器服务。多架构镜像（**linux/arm64 + linux/amd64**），适配树莓派 4/5（64 位系统）、Oracle/AWS ARM 云主机、ARM 架构 NAS 等。
+
+> 实现对齐活跃维护的开源项目 [claabs/epicgames-freegames-node](https://github.com/claabs/epicgames-freegames-node)（2026-11 仍活跃）：设备码授权 + `EPIC_EG1` 会话 + 结账页自动点击下单，并额外做了全自动下单（claabs 目前仅推送链接需人工点击）。
+
+## 快速开始
+
+```bash
+# 1. 上传本目录到 ARM 主机，进入目录
+docker compose build                       # 在主机上原生构建（无需 QEMU）
+
+# 2. 启动后打开面板 http://主机IP:8321/ → 点"🔑 生成授权链接"→ 浏览器打开链接完成 Epic 登录
+#    （命令行方式：docker compose run --rm epic python main.py login）
+
+# 3. 启动常驻服务（默认每 6 小时检测领取一次）
+docker compose up -d
+docker compose logs -f
+```
+
+账号密码/两步验证/人机验证全部在 Epic 官方页面完成，本程序不接触你的凭据；凭据（可长期续期的 OAuth token）加密保存在 `./data/auth.json`（权限 600）。
+
+## 命令
+
+| 命令 | 说明 |
+|---|---|
+| `docker compose run --rm epic python main.py login` | 首次登录 / 重新授权（也可直接在面板点"生成授权链接"，更方便） |
+| `docker compose up -d` | 常驻运行，周期自动领取 |
+| `docker compose run --rm epic python main.py once` | 立即执行一次领取 |
+| `docker compose run --rm epic python main.py detect` | 只看本周免费游戏（无需登录） |
+
+## 可视化面板
+
+常驻运行时自带 Web 面板：**http://主机IP:8321/**
+
+- 账号在线状态、上次/下次运行时间（倒计时）
+- **一键授权登录**：未登录时点"生成授权链接"，页面直接显示 Epic 官方授权链接（可点击），登录成功自动识别，无需重启
+- 本周免费游戏列表（可领取 / 已领取 / 已拥有 / 失败 状态标记）
+- 上次领取结果明细、实时运行日志
+- 按钮：**立即检测领取**、**刷新免费列表**（免登录可用）
+
+纯标准库实现（无 CDN、无新依赖），NAS 内网直接访问。
+
+## 配置（docker-compose.yml environment）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `CLAIM_INTERVAL_HOURS` | `6` | 检测频率（小时） |
+| `EPIC_COUNTRY` | `US` | 账号所在地区（US/CN/HK…），影响地区黑名单过滤 |
+| `EPIC_LOCALE` | `en-US` | 商店 locale |
+| `WEB_PORT` | `8321` | 可视化面板端口（`0` 关闭面板；compose 已映射 `8321:8321`） |
+| `PUID` / `PGID` | `1000` | 容器运行用户（NAS 上改为自己宿主机用户的，终端 `id -u` / `id -g` 查看），启动时自动修正 `./data` 属主 |
+| `TZ` | `Asia/Shanghai` | 时区（日志时间） |
+| `NOTIFY_METHOD` | `none` | 通知方式：`ntfy` / `bark` / `webhook` / `none` |
+| `NOTIFY_URL` | — | ntfy: `https://ntfy.sh/主题`；Bark: `https://api.day.app/你的Key`；webhook: 任意接收 POST JSON 的地址 |
+
+通知内容：领取成功（含游戏名）、领取失败（含原因）、需要重新登录。
+
+## 数据目录（`./data` 卷）
+
+- `auth.json` — OAuth 凭据（自动续期，权限 600）
+- `last_run.json` — 最近一次运行结果
+- `logs/` — 领取失败时的结账页截图（排查用）
+
+## 工作原理
+
+1. **登录**（一次）：Epic 设备码授权，保存可长期滚动的 refresh token；
+2. **会话**：access token 作为 `EPIC_BEARER_TOKEN` cookie 注入无头 Chromium，访问商店页换取 `EPIC_EG1` 会话；
+3. **检测**：公开接口 `freeGamesPromotions` → `getMappingByPageSlug`/CMS 解析真实 offer → `getCatalogOffer` 校验 → `getOffersValidation` 过滤已拥有（GraphQL persisted query 与官方页面一致）；
+4. **领取**：打开 `store/purchase` 结账页，注入 JS 自动勾选 EULA、点击下单按钮，随后 API 复核入库；EULA 自动接受、token 自动续期；
+5. **调度**：容器内循环；也可 `command: python main.py once` 配合外置 cron。
+
+## 本地开发 / 测试
+
+```bash
+python test_parser.py          # 解析逻辑自测（纯标准库，无依赖）
+python main.py detect          # 实测拉取本周免费游戏
+pip install playwright && playwright install chromium   # 本地跑领取流程才需要
+```
+
+## 故障排查
+
+- **Permission denied: '/data/auth.json'**：绑定挂载目录属主与容器运行用户不一致（Docker 自动创建的挂载目录属主是 root；NAS 上属主通常是宿主机用户）。入口脚本启动时会按 `PUID/PGID` 自动 `chown` 修正，改好 `PUID/PGID` 后 `docker compose up -d --build` 即可。若存储不支持 chown（如 CIFS 共享），在宿主机手动执行 `sudo chown -R $(id -u):$(id -g) ./data`。
+- **Cloudflare 质询（cf_challenge）**：部分机房/共享 IP 会对商店 GraphQL 的 entitlements 路径触发机器人质询。本项目所有权判断已改走 Epic 自家 REST 服务（`catalog-public-service` + `entitlement-public-service`，Bearer 认证，不走 Cloudflare），一般不会再遇到；公开接口（免费列表/映射/校验）不受影响。
+- **领取失败排查**：`data/logs/` 下有结账页截图；自动点击失效一般是 Epic 改版，更新 `epic/claimer.py` 的 `CHECKOUT_JS` 选择器即可。
+- **登录遇人机验证 / 凭据失效**：人机验证需手动通过一次；凭据过期后在面板重新"生成授权链接"即可，无需重启容器。
+
+## 已知限制
+
+- 不支持 armv7（32 位树莓派系统）；64 位系统（`uname -m` 显示 `aarch64`）均可。
+- Epic 登录遇到人机验证需手动完成；凭据长期未运行失效后需重新 `login`。
+- Epic 改版结账页可能使自动点击失效（`epic/claimer.py` 的 `CHECKOUT_JS` 已做多选择器 + 多语言兜底，失败会截图到 `data/logs/`，届时更新选择器即可）。
+- 仅供个人学习使用，请遵守 Epic 服务条款。
