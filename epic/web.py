@@ -15,9 +15,11 @@ import json
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-from . import api, parser, state
+from . import __version__, api, parser, state
+
+_LIB_LOCK = threading.Lock()
 
 
 def _iso(ts) -> str | None:
@@ -58,6 +60,9 @@ def _detect_bg(cfg: dict) -> None:
         old = {g["title"]: g.get("status") for g in (state.snapshot()["free_games"] or [])}
         old_end = {g["title"]: g.get("end_date") for g in (state.snapshot()["free_games"] or [])}
         state.set_free_games(games, {g["title"]: old.get(g["title"], "claimable") for g in games}, old_end)
+        # 成功后清掉历史错误，否则面板会一直弹上一次失败留下的红字
+        with state.LOCK:
+            state.STATE["last_error"] = None
         state.log(f"面板：免费游戏列表已刷新（{len(games)} 款）")
     except Exception as e:
         with state.LOCK:
@@ -79,12 +84,34 @@ def _login_bg() -> None:
     run_login_flow(log_fn=state.log)
 
 
+def _library_bg(cfg: dict) -> None:
+    """后台构建游戏库（entitlements + catalog bulk，请求较多，耗时一两分钟）"""
+    from . import library as libmod, store
+
+    try:
+        token = store.load(cfg["DATA_DIR"])
+        if token:
+            from main import fresh_token
+
+            token = fresh_token(token) or token
+        if not token or not token.get("access_token"):
+            state.log("游戏库：未登录，无法构建")
+            return
+        lib = libmod.build_library(token, cfg["COUNTRY"], cfg["LOCALE"], log=state.log)
+        libmod.save_library(cfg["DATA_DIR"], lib)
+        state.log(f"游戏库构建完成：{lib['count']} 款游戏")
+    except Exception as e:
+        state.log(f"游戏库构建失败：{e}")
+    finally:
+        _LIB_LOCK.release()
+
+
 def _start_thread(target, *args) -> None:
     threading.Thread(target=target, args=args, daemon=True).start()
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "EpicFreeDash/1.0"
+    server_version = f"EpicFreeDash/{__version__}"
     cfg: dict = {}
 
     def log_message(self, fmt, *args):  # 静默访问日志（面板轮询太吵）
@@ -131,6 +158,24 @@ class Handler(BaseHTTPRequestHandler):
                     "expires_at": _iso(snap["login_expires_at"]),
                 },
                 ensure_ascii=False))
+        elif path == "/api/library":
+            from . import library as libmod
+
+            lib = libmod.load_library(self.cfg["DATA_DIR"]) or {}
+            self._send(200, "application/json; charset=utf-8", json.dumps(lib, ensure_ascii=False))
+        elif path == "/api/achievements":
+            ns = (parse_qs(urlparse(self.path).query).get("namespace") or [""])[0]
+            if not ns:
+                self._send(400, "application/json; charset=utf-8",
+                           json.dumps({"ok": False, "message": "缺少 namespace 参数"}))
+                return
+            try:
+                data = api.fetch_game_achievements(ns, self.cfg.get("LOCALE", "en-US"))
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps({"ok": True, **data}, ensure_ascii=False))
+            except Exception as e:
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps({"ok": False, "message": str(e)}, ensure_ascii=False))
         else:
             self._send(404, "text/plain; charset=utf-8", "not found")
 
@@ -156,6 +201,22 @@ class Handler(BaseHTTPRequestHandler):
             _start_thread(_login_bg)
             self._send(200, "application/json; charset=utf-8",
                        json.dumps({"ok": True, "message": "正在生成 Epic 授权链接…"}))
+        elif path == "/api/library/refresh":
+            if not _LIB_LOCK.acquire(blocking=False):
+                self._send(409, "application/json; charset=utf-8",
+                           json.dumps({"ok": False, "message": "游戏库正在构建中，请稍候"}))
+                return
+            from . import store
+
+            token = store.load(self.cfg["DATA_DIR"])
+            if not token:
+                _LIB_LOCK.release()
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps({"ok": False, "message": "未登录，请先授权登录"}))
+                return
+            _start_thread(_library_bg, self.cfg)
+            self._send(200, "application/json; charset=utf-8",
+                       json.dumps({"ok": True, "message": "正在构建游戏库（数量多时需一两分钟）…"}))
         else:
             self._send(404, "text/plain; charset=utf-8", "not found")
 
@@ -200,6 +261,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
   h1 { font-size: 22px; }
   h1 span { margin-right: 8px; }
+  h1 sup { font-size: 11px; color: var(--muted); margin-left: 6px; font-weight: 500; vertical-align: super; }
   .chip {
     font-size: 12px; padding: 4px 12px; border-radius: 999px;
     background: var(--card); border: 1px solid var(--line); color: var(--muted);
@@ -252,6 +314,21 @@ PAGE_HTML = r"""<!DOCTYPE html>
   #loginUrl { color: var(--accent); word-break: break-all; font-size: 14px; }
   #loginBox { margin-top: 10px; background: rgba(0,120,242,.10); border-radius: 8px; padding: 10px 12px; }
   #loginMeta { margin-top: 6px; color: var(--muted); font-size: 13px; }
+  /* ---- 游戏库 ---- */
+  .lib-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .lib-search { background: #0b0f18; border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 8px 12px; font-size: 13px; width: 180px; }
+  .lib-list { max-height: 340px; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; }
+  .lib-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,.05); font-size: 14px; }
+  .lib-row:last-child { border-bottom: 0; }
+  .lib-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lib-en { color: var(--muted); font-size: 12px; margin-left: 8px; }
+  .lib-meta { color: var(--muted); font-size: 12px; }
+  .btn-mini { padding: 4px 10px; font-size: 12px; border-radius: 8px; background: transparent; border: 1px solid var(--line); color: var(--muted); cursor: pointer; }
+  .btn-mini:hover { color: var(--text); border-color: var(--accent); }
+  .ach-detail { background: #0b0f18; border-radius: 8px; padding: 10px 12px; margin: 8px 10px; font-size: 13px; max-height: 260px; overflow-y: auto; }
+  .ach-item { padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,.05); }
+  .ach-item:last-child { border-bottom: 0; }
+  .ach-xp { color: #ffe08a; }
   #toast {
     position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
     background: #223; border: 1px solid var(--line); color: var(--text);
@@ -265,7 +342,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <body>
 <div class="wrap">
   <header>
-    <h1><span>🎁</span>Epic 白嫖助手</h1>
+    <h1><span>🎁</span>Epic 白嫖助手<sup class="ver">v__VERSION__</sup></h1>
     <div id="acct" class="chip">加载中…</div>
   </header>
 
@@ -310,6 +387,18 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <div id="log"></div>
     </div>
   </div>
+
+  <div class="card" style="margin-top:14px">
+    <div class="lib-head">
+      <h2 style="margin:0">📚 游戏库 <span id="libCount" class="lib-meta"></span></h2>
+      <span style="display:flex;gap:8px;align-items:center">
+        <input id="libSearch" class="lib-search" placeholder="搜索游戏…">
+        <button id="btnLibRefresh" class="ghost">↻ 刷新游戏库</button>
+      </span>
+    </div>
+    <div id="libMeta" class="lib-meta" style="margin-bottom:8px"></div>
+    <div id="libList" class="lib-list"><div class="empty">还没有数据 — 登录后点"刷新游戏库"构建</div></div>
+  </div>
 </div>
 <div id="toast"></div>
 
@@ -338,11 +427,12 @@ function fmtEnd(iso) {
 }
 
 const TAG = {claimable:'可领取', claimed:'已领取', owned:'已拥有', failed:'领取失败'};
+// 已弹过的错误，避免每 5 秒轮询都把同一条错误重新弹一次
+let LAST_ERR = null;
 
 async function pollStatus() {
   try {
-    const s = await (await fetch('/api/status')).json();
-    serverOffsetMs = new Date(s.server_time).getTime() - Date.now();
+    const s = await (await fetch('/api/status')).json();    serverOffsetMs = new Date(s.server_time).getTime() - Date.now();
     nextRunAt = s.next_run_at ? new Date(s.next_run_at).getTime() : null;
 
     const acct = $('acct');
@@ -356,7 +446,12 @@ async function pollStatus() {
     $('stInterval').textContent = '每 ' + s.interval_hours + ' 小时';
     $('stRegion').textContent = s.country + ' / ' + s.notify_method;
     $('btnRun').disabled = s.busy;
-    if (s.last_error) toast('⚠ ' + s.last_error);
+    if (s.last_error && s.last_error !== LAST_ERR) {
+      LAST_ERR = s.last_error;
+      toast('⚠ ' + s.last_error);
+    } else if (!s.last_error) {
+      LAST_ERR = null;
+    }
   } catch (e) { /* 服务未就绪 */ }
 }
 
@@ -471,14 +566,88 @@ $('btnRun').onclick = () => post('/api/run');
 $('btnDetect').onclick = () => post('/api/detect');
 $('btnLogin').onclick = () => post('/api/login');
 
-pollStatus(); pollGames(); pollSummary(); pollLogs(); pollLogin();
+// ---------- 游戏库 ----------
+let LIB = null;
+
+async function pollLibrary() {
+  try {
+    const r = await (await fetch('/api/library')).json();
+    if (LIB && LIB.updated_at === r.updated_at) return;
+    LIB = r;
+    $('libCount').textContent = r.count ? `（${r.count} 款）` : '';
+    $('libMeta').textContent = r.updated_at ? '更新于 ' + fmtTs(r.updated_at) : '';
+    renderLibrary();
+  } catch (e) {}
+}
+
+function renderLibrary() {
+  const box = $('libList');
+  if (!LIB || !LIB.games || !LIB.games.length) {
+    box.innerHTML = '<div class="empty">还没有数据 — 登录后点"刷新游戏库"构建</div>';
+    return;
+  }
+  const q = ($('libSearch').value || '').trim().toLowerCase();
+  const games = LIB.games.filter(g => {
+    if (!q) return true;
+    const en = (g.title || '').toLowerCase();
+    const zh = (g.title_zh || '').toLowerCase();
+    return en.includes(q) || zh.includes(q);
+  });
+  box.innerHTML = games.map(g => `
+    <div class="lib-row">
+      <div class="lib-title" title="${escapeHtml(g.title)}">${escapeHtml(g.title_zh || g.title)}${g.title_zh ? `<span class="lib-en">${escapeHtml(g.title)}</span>` : ''}</div>
+      <button class="btn-mini" data-ns="${escapeHtml(g.namespace)}">🏆 成就</button>
+    </div>`).join('') || '<div class="empty">无匹配结果</div>';
+  box.querySelectorAll('.btn-mini').forEach(btn => {
+    btn.onclick = () => toggleAch(btn, btn.dataset.ns);
+  });
+}
+
+async function toggleAch(btn, ns) {
+  const row = btn.closest('.lib-row');
+  const next = row.nextElementSibling;
+  if (next && next.classList && next.classList.contains('ach-detail')) { next.remove(); return; }
+  btn.disabled = true;
+  try {
+    const r = await (await fetch('/api/achievements?namespace=' + encodeURIComponent(ns))).json();
+    const div = document.createElement('div');
+    div.className = 'ach-detail';
+    if (!r.ok) {
+      div.innerHTML = `<div class="empty">${escapeHtml(r.message || '查询失败')}</div>`;
+    } else if (!r.total) {
+      div.innerHTML = '<div class="empty">该游戏没有成就数据</div>';
+    } else {
+      const rows = (r.achievements || []).map(a => `
+        <div class="ach-item">
+          <div>${a.hidden ? '🔒 ' : ''}${escapeHtml(a.name)}
+            <span class="ach-xp">+${a.xp} XP</span>
+            ${a.rarity_percent != null ? `<span class="lib-meta">· 全服 ${a.rarity_percent}% 玩家拥有</span>` : ''}
+          </div>
+          <div class="lib-meta">${escapeHtml(a.description || '')}</div>
+        </div>`).join('');
+      div.innerHTML = `<div style="margin-bottom:6px">共 <b>${r.total}</b> 个成就 · 总计 <b class="ach-xp">${r.xp} XP</b></div>${rows}`;
+    }
+    row.after(div);
+  } catch (e) {
+    toast('成就查询失败');
+  }
+  btn.disabled = false;
+}
+
+$('libSearch').oninput = renderLibrary;
+$('btnLibRefresh').onclick = () => post('/api/library/refresh');
+
+pollStatus(); pollGames(); pollSummary(); pollLogs(); pollLogin(); pollLibrary();
 setInterval(pollStatus, 5000);
 setInterval(pollGames, 8000);
 setInterval(pollSummary, 8000);
 setInterval(pollLogs, 4000);
 setInterval(pollLogin, 3000);
+setInterval(pollLibrary, 8000);
 setInterval(renderNext, 1000);
 </script>
 </body>
 </html>
 """
+
+PAGE_HTML = PAGE_HTML.replace("__VERSION__", __version__)

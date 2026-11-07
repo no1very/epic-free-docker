@@ -5,6 +5,7 @@
 
 import base64
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,15 +54,26 @@ class OAuthError(Exception):
 
 
 def _http(url: str, *, method: str = "GET", headers=None, data=None, timeout=30):
-    """通用 HTTP，返回 (status, body_text)"""
-    req = urllib.request.Request(url, data=data, method=method)
-    for k, v in (headers or {}).items():
-        req.add_header(k, v)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")
+    """通用 HTTP，返回 (status, body_text)。
+
+    连接/读取超时这类网络层异常会自动重试（最多 3 次，间隔递增），
+    避免一次 SSL 握手抖动就让整轮游戏库构建失败。
+    """
+    last: Exception | None = None
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=data, method=method)
+        for k, v in (headers or {}).items():
+            req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last = e
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    raise last if last else RuntimeError(f"请求失败：{url}")
 
 
 def _form(data: dict) -> bytes:
@@ -229,8 +241,13 @@ def fetch_offer_item_ids(token: dict, namespace: str, offer_id: str) -> list[str
 
 def fetch_entitlement_names(token: dict) -> set[str]:
     """entitlements REST：账号全部 entitlementName（= catalog item id）集合"""
-    names: set[str] = set()
-    start, count = 0, 5000
+    return {e["entitlementName"] for e in fetch_entitlements(token) if e.get("entitlementName")}
+
+
+def fetch_entitlements(token: dict) -> list[dict]:
+    """entitlements REST：账号全部 entitlement 原始对象（含 namespace/status），分页"""
+    items: list[dict] = []
+    start, count = 0, 1000
     while True:
         url = (
             f"{ENTITLEMENT_SERVICE}/entitlement/api/account/{token['account_id']}"
@@ -242,12 +259,159 @@ def fetch_entitlement_names(token: dict) -> set[str]:
         )
         if status != 200:
             raise RuntimeError(f"entitlements 查询失败: {status} {body[:150]}")
-        items = json.loads(body)
-        for e in items:
-            name = e.get("entitlementName")
-            if name:
-                names.add(name)
-        if len(items) < count:
+        page = json.loads(body)
+        items.extend(page)
+        if len(page) < count:
             break
         start += count
-    return names
+    return items
+
+
+def fetch_bulk_items(token: dict, namespace: str, item_ids: list[str], country: str, locale: str) -> dict:
+    """catalog bulk/items：批量把 catalog item id 解析为 item 详情（title/categories/releaseInfo）。
+
+    id 参数逗号分隔分块；分块失败时逐个重试，坏数据不影响其余。
+    返回 {item_id: item_dict}。
+    """
+    out: dict = {}
+    for i in range(0, len(item_ids), 20):
+        chunk = item_ids[i : i + 20]
+        params = urllib.parse.urlencode(
+            {
+                "id": ",".join(chunk),
+                "includeDLCDetails": "true",
+                "includeMainGameDetails": "true",
+                "country": country,
+                "locale": locale,
+            }
+        )
+        url = f"{CATALOG_SERVICE}/catalog/api/shared/namespace/{namespace}/bulk/items?{params}"
+        status, body = _http(
+            url,
+            headers={"Authorization": f"Bearer {token['access_token']}", "Accept": "application/json"},
+        )
+        if status == 200:
+            out.update(json.loads(body))
+            continue
+        # 分块失败：逐个重试，隔离坏数据
+        for one in chunk:
+            p1 = urllib.parse.urlencode(
+                {
+                    "id": one,
+                    "includeDLCDetails": "true",
+                    "includeMainGameDetails": "true",
+                    "country": country,
+                    "locale": locale,
+                }
+            )
+            s1, b1 = _http(
+                f"{CATALOG_SERVICE}/catalog/api/shared/namespace/{namespace}/bulk/items?{p1}",
+                headers={"Authorization": f"Bearer {token['access_token']}", "Accept": "application/json"},
+            )
+            if s1 == 200:
+                out.update(json.loads(b1))
+    return out
+
+
+def fetch_namespace_offers(
+    token: dict, namespace: str, country: str, locale: str, count: int = 5
+) -> list:
+    """按 namespace 拉取 offer 列表。
+
+    catalog item 对受众授权只返回内部代号（如 SerpentineGeneralAudience），
+    而 offer 的 title 才是真实游戏名（如 Saints Row），用于反查游戏库标题。
+    """
+    q = urllib.parse.urlencode({"country": country, "locale": locale, "count": count})
+    url = f"{CATALOG_SERVICE}/catalog/api/shared/namespace/{namespace}/offers?{q}"
+    status, body = _http(
+        url,
+        headers={"Authorization": f"Bearer {token['access_token']}", "Accept": "application/json"},
+    )
+    if status != 200:
+        return []
+    try:
+        return (json.loads(body) or {}).get("elements") or []
+    except Exception:
+        return []
+
+
+# ================= 成就（游戏库展示用，公开 GraphQL） =================
+
+_ACHIEVEMENT_QUERY = """query Achievement($sandboxId: String!, $locale: String!) {
+  Achievement {
+    productAchievementsRecordBySandbox(sandboxId: $sandboxId, locale: $locale) {
+      productId
+      sandboxId
+      totalAchievements
+      totalProductXP
+      achievementSets {
+        achievementSetId
+        isBase
+        totalAchievements
+        totalXP
+      }
+      achievements {
+        achievement {
+          name
+          hidden
+          isBase
+          unlockedDisplayName
+          unlockedDescription
+          lockedDescription
+          XP
+          rarity { percent }
+        }
+      }
+    }
+  }
+}"""
+
+WEBSITE_GRAPHQL = "https://website.graphql.epicgames.com/graphql"
+
+
+def fetch_game_achievements(namespace: str, locale: str = "en-US") -> dict:
+    """公开成就查询（Epic 网站 GraphQL，无需登录）。
+
+    返回 {total, xp, achievements: [{name, description, xp, rarity_percent, hidden}]}；
+    无成就记录时返回 {total: 0, ...}。
+    """
+    payload = json.dumps(
+        {
+            "operationName": "Achievement",
+            "variables": {"sandboxId": namespace, "locale": locale},
+            "query": _ACHIEVEMENT_QUERY,
+        }
+    ).encode()
+    status, body = _http(
+        WEBSITE_GRAPHQL,
+        method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": DESKTOP_UA},
+        data=payload,
+    )
+    if status != 200:
+        raise RuntimeError(f"成就查询失败: HTTP {status}")
+    d = json.loads(body)
+    if d.get("errors"):
+        raise RuntimeError(f"成就查询错误: {json.dumps(d['errors'], ensure_ascii=False)[:150]}")
+    rec = (d.get("data") or {}).get("Achievement", {}).get("productAchievementsRecordBySandbox")
+    if not rec:
+        return {"total": 0, "xp": 0, "achievements": []}
+    achs = []
+    for a in rec.get("achievements") or []:
+        info = a.get("achievement") or {}
+        if not info:
+            continue
+        achs.append(
+            {
+                "name": info.get("unlockedDisplayName") or info.get("name", ""),
+                "description": info.get("unlockedDescription") or info.get("lockedDescription", ""),
+                "xp": info.get("XP", 0),
+                "rarity_percent": (info.get("rarity") or {}).get("percent"),
+                "hidden": bool(info.get("hidden")),
+            }
+        )
+    return {
+        "total": rec.get("totalAchievements", len(achs)),
+        "xp": rec.get("totalProductXP", 0),
+        "achievements": achs,
+    }
