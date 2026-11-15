@@ -41,6 +41,7 @@ def set_free_games(games: list[dict], status_map: dict, end_map: dict | None = N
             {
                 "title": g.get("title", ""),
                 "offer_id": g.get("offerId") or g.get("offer_id", ""),
+                "namespace": g.get("namespace") or g.get("sandboxId") or "",
                 "end_date": (end_map or {}).get(g.get("title")) or g.get("endDate") or g.get("end_date"),
                 "status": status_map.get(g.get("title"), "claimable"),
             }

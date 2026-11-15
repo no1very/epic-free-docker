@@ -293,6 +293,12 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .game .name { font-size: 15px; font-weight: 600; }
   .game .end { font-size: 12px; color: var(--muted); margin-top: 3px; }
   .tag { font-size: 12px; padding: 3px 10px; border-radius: 999px; white-space: nowrap; }
+  .btn-link {
+    font-size: 12px; padding: 4px 10px; border-radius: 6px; text-decoration: none;
+    color: #bfe0ff; border: 1px solid rgba(0,120,242,.55); background: rgba(0,120,242,.12);
+    white-space: nowrap;
+  }
+  .btn-link:hover { background: rgba(0,120,242,.28); }
   .tag.claimable { color: #b6f2c1; background: rgba(76,175,80,.15); }
   .tag.claimed { color: #bfe3ff; background: rgba(33,150,243,.18); }
   .tag.owned { color: var(--muted); background: rgba(152,162,184,.15); }
@@ -472,12 +478,23 @@ async function pollGames() {
       box.innerHTML = '<div class="empty">暂无数据 — 点"刷新免费列表"获取</div>';
       return;
     }
-    box.innerHTML = r.games.map(g => `
+    box.innerHTML = r.games.map(g => {
+      const href = (g.namespace && g.offer_id)
+        ? 'https://www.epicgames.com/store/purchase?highlightColor=0078f2&offers=1-'
+          + encodeURIComponent(g.namespace) + '-' + encodeURIComponent(g.offer_id)
+          + '&orderId&purchaseToken&showNavigation=true'
+        : '';
+      const canClaim = (g.status === 'claimable' || g.status === 'failed') && href;
+      return `
       <div class="game">
         <div><div class="name">${escapeHtml(g.title)}</div>
              <div class="end">${fmtEnd(g.end_date)}</div></div>
-        <span class="tag ${g.status}">${TAG[g.status] || '可领取'}</span>
-      </div>`).join('');
+        <div style="display:flex;align-items:center;gap:8px">
+          ${canClaim ? `<a class="btn-link" href="${href}" target="_blank" rel="noopener">手动领取</a>` : ''}
+          <span class="tag ${g.status}">${TAG[g.status] || '可领取'}</span>
+        </div>
+      </div>`;
+    }).join('');
   } catch (e) {}
 }
 

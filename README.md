@@ -1,6 +1,6 @@
 # Epic 白嫖助手 · Docker 版（支持 ARM）
 
-**当前版本：v1.1**
+**当前版本：v1.1.1**
 
 自动领取 Epic Games 商店每周免费游戏的容器服务。多架构镜像（**linux/arm64 + linux/amd64**），适配树莓派 4/5（64 位系统）、Oracle/AWS ARM 云主机、ARM 架构 NAS 等。
 
@@ -89,6 +89,9 @@ pip install playwright && playwright install chromium   # 本地跑领取流程�
 - **Permission denied: '/data/auth.json'**：绑定挂载目录属主与容器运行用户不一致（Docker 自动创建的挂载目录属主是 root；NAS 上属主通常是宿主机用户）。入口脚本启动时会按 `PUID/PGID` 自动 `chown` 修正，改好 `PUID/PGID` 后 `docker compose up -d --build` 即可。若存储不支持 chown（如 CIFS 共享），在宿主机手动执行 `sudo chown -R $(id -u):$(id -g) ./data`。
 - **Cloudflare 质询（cf_challenge）**：部分机房/共享 IP 会对商店 GraphQL 的 entitlements 路径触发机器人质询。本项目所有权判断已改走 Epic 自家 REST 服务（`catalog-public-service` + `entitlement-public-service`，Bearer 认证，不走 Cloudflare），一般不会再遇到；公开接口（免费列表/映射/校验）不受影响。
 - **领取失败排查**：`data/logs/` 下有结账页截图；自动点击失效一般是 Epic 改版，更新 `epic/claimer.py` 的 `CHECKOUT_JS` 选择器即可。
+- **日志说"页面未渲染完成"但截图是 Cloudflare 的 "Verify you are human"**：无头浏览器被 Cloudflare 拦截。镜像内已自带 Xvfb，入口脚本会拉起 `:99` 虚拟屏并把 `DISPLAY` 传给主进程，`Claimer.start()` 检测到 `DISPLAY` 就用 headful Chromium。若你自行改回 `headless=True` 就会重现。
+- **日志说"需要人工完成人机验证（hCaptcha）"**：Epic 在免费领取的结账页会对部分 IP 弹 hCaptcha 图形验证（拖字母 / 找出不同形状），这是设计给真人操作的，程序无法通过。面板「本周免费游戏」每行都有 **手动领取** 按钮，点开结账页 → 点 **Add to library** → 完成验证即可，30 秒左右。
+- **按钮文字变了导致点不到**：2026-11 起免费领取按钮文案是 `Add to library`（早期是 `Place order`）。`CHECKOUT_JS` 已同时匹配文案与 `data-testid`，Epic 再改版时优先看截图里的按钮文字。
 - **登录遇人机验证 / 凭据失效**：人机验证需手动通过一次；凭据过期后在面板重新"生成授权链接"即可，无需重启容器。
 - **`_ssl.c:994 handshake timed out` / `UNEXPECTED_EOF_WHILE_READING`**：两条独立成因。① 免费列表 CDN 被网络阻断 → 配 `HTTPS_PROXY` 走代理；② 路径 MTU 黑洞（大包被静默丢弃，TLS 证书包超阈值即卡到超时）→ 用 `ping -M do -s 1472 IP` 二分定位，下调网卡 MTU 后再让容器继承，例如 compose 里给项目网络加 `driver_opts: {com.docker.network.driver.mtu: "1468"}`。v1.1 已给 `_http` 加了 3 次重试（1.5s / 3s 退避），单次抖动不会再毁掉整轮运行。
 - **面板一直弹同一条错误**：v1.1 已修——会话/列表刷新成功时会清空 `last_error`，前端对相同错误做去重，只在错误变化时提示。
@@ -109,6 +112,12 @@ pip install playwright && playwright install chromium   # 本地跑领取流程�
 - **并发构建**：250 个 namespace 8 路并发解析，构建耗时从一两分钟降到约 15 秒。
 - **网络健壮性**：`_http` 增加 3 次指数退避重试；解决单次 SSL 抖动导致整轮构建失败。
 - **面板错误提示去重**：成功时清空 `last_error`，前端仅在错误变化时弹提示（修掉"一次失败永久每 5 秒弹窗"）。
+- **领取链路修复（v1.1.1）**：
+  - 结账页改用 headful Chromium（容器内 Xvfb 虚拟屏），绕过 Cloudflare 对无头浏览器的 "Verify you are human" 拦截；
+  - 下单按钮文案适配 2026-11 的 `Add to library`（原先只认 `Place order`，导致一直扫不到按钮、误报"页面未渲染完成"）；
+  - 新增 hCaptcha 检测：弹出图形验证时 6 秒内报出准确原因，不再白等 60 秒；
+  - 面板「本周免费游戏」新增 **手动领取** 按钮，直连结账页，验证过不去了点两下就能领；
+  - 构建修复：基础镜像换 Debian 13 后补 `libatomic1`，并显式装 `xvfb`/`xauth`。
 - **文档**：补充代理与 MTU 黑洞两类握手超时的排查路径。
 
 ### v1.0

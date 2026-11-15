@@ -36,7 +36,12 @@ CHECKOUT_JS = """
       '.pay-view .btn-primary',
       '.payment-payment-methods .btn-primary',
       '[data-component="PN_PlaceOrder"] button',
-      '#purchase-app .btn-primary'
+      '#purchase-app .btn-primary',
+      '[data-testid="purchase-button"]',
+      '[data-testid="place-order"]',
+      'button[data-testid*="purchase"]',
+      'button[data-testid*="add-to"]',
+      'button[data-testid*="order"]'
     ];
     var i, j, els;
     for (i = 0; i < sels.length; i++) {
@@ -45,7 +50,10 @@ CHECKOUT_JS = """
         if (els[j].offsetParent !== null) return els[j];
       }
     }
-    var texts = ['place order', 'place free order', 'continue', '下单', '下订单', '免费下单', '免费获取', '继续'];
+    // 2026-11 起免费领取按钮文案是 "Add to library"（不是 Place order），必须单独匹配
+    var texts = ['place order', 'place free order', 'add to library', 'add to my library',
+                 'add to cart', 'continue', '下单', '下订单', '免费下单', '免费获取',
+                 '添加到库', '添加至库', '加入游戏库', '加入库', '继续', '获取'];
     var btns = document.querySelectorAll('button, [role=button], .btn-primary');
     var k, m, t;
     for (k = 0; k < btns.length; k++) {
@@ -110,11 +118,16 @@ class Claimer:
     # ---------- 生命周期 ----------
 
     def start(self):
+        import os
+
         from playwright.sync_api import sync_playwright  # 延迟导入
 
+        # 有虚拟显示（镜像内置 Xvfb）时用 headful：Epic 结账页会对无头浏览器
+        # 直接弹 Cloudflare 人机验证，headful 才能正常渲染出下单按钮。
+        headful = bool(os.environ.get("DISPLAY"))
         self._pw = sync_playwright().start()
         self.browser = self._pw.chromium.launch(
-            headless=True,
+            headless=not headful,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
         self.context = self.browser.new_context(user_agent=api.DESKTOP_UA, locale="en-US")
@@ -323,6 +336,19 @@ class Claimer:
 
     # ---------- 领取 ----------
 
+    CAPTCHA_SEL = ('iframe[src*="hcaptcha"], iframe[title*="hCaptcha"], #hcaptcha, '
+                   'iframe[src*="recaptcha"], iframe[title*="challenge"]')
+
+    def _has_captcha(self) -> bool:
+        """页面是否弹出人工验证（Epic 在免费领取时会挂 hCaptcha 拖拽图）。"""
+        try:
+            return bool(self.page.evaluate(
+                "(() => { try { return !!document.querySelector('%s'); } catch (e) { return false; } })()"
+                % self.CAPTCHA_SEL
+            ))
+        except Exception:
+            return False
+
     def claim_offer(self, offer: dict) -> tuple[bool, str]:
         """加载结账页 → 注入自动点击脚本 → 轮询状态 → API 复核入库。"""
         try:
@@ -335,6 +361,9 @@ class Claimer:
             deadline = time.time() + 100
             while time.time() < deadline:
                 time.sleep(2)
+                if self._has_captcha():
+                    self._screenshot(offer)
+                    return False, "需要人工完成人机验证（hCaptcha），请手动领取"
                 raw = self.page.evaluate("JSON.stringify(window.__efg || null)")
                 if not raw or raw == "null":
                     continue
@@ -349,6 +378,13 @@ class Claimer:
                 self._screenshot(offer)
                 return False, f"自动下单未完成（{detail or '页面未渲染完成'}）"
             self.log(f"{offer['title']}：已点击下单（{detail}），等待入库…")
+
+            # 点击后 Epic 常挂 hCaptcha（拖图/选形状），出现即判定需人工，别白等 60 秒
+            for _ in range(12):
+                if self._has_captcha():
+                    self._screenshot(offer)
+                    return False, "需要人工完成人机验证（hCaptcha），请手动领取"
+                time.sleep(1)
 
             if self._verify_owned(offer):
                 return True, "ok"

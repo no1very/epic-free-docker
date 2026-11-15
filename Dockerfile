@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/tmp
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tzdata ca-certificates gosu \
+    && apt-get install -y --no-install-recommends tzdata ca-certificates gosu libatomic1 xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
